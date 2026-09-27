@@ -52,8 +52,13 @@ func handleTarTypeBlockCharFifo(hdr *tar.Header, path string) error {
 	return nil
 }
 
-func handleLChmod(hdr *tar.Header, path string, hdrInfo os.FileInfo) error {
+func handleLChmod(hdr *tar.Header, path, hardlinkTarget string, hdrInfo os.FileInfo) error {
 	return nil
+}
+
+// hardlink creates newname as a hard link to the oldname file.
+func hardlink(oldname, newname string) error {
+	return os.Link(oldname, newname)
 }
 
 func getFileUIDGID(stat interface{}) (int, int, error) {

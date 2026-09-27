@@ -70,9 +70,12 @@ func handleTarTypeBlockCharFifo(hdr *tar.Header, path string) error {
 	return mknod(path, mode, unix.Mkdev(uint32(hdr.Devmajor), uint32(hdr.Devminor)))
 }
 
-func handleLChmod(hdr *tar.Header, path string, hdrInfo os.FileInfo) error {
+// handleLChmod applies the mode from hdrInfo to path, skipping symlinks (there
+// is no lchmod). For hardlinks, the mode is applied only when the link target
+// (hardlinkTarget, resolved within the extraction root) is not a symlink.
+func handleLChmod(hdr *tar.Header, path, hardlinkTarget string, hdrInfo os.FileInfo) error {
 	if hdr.Typeflag == tar.TypeLink {
-		if fi, err := os.Lstat(hdr.Linkname); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
+		if fi, err := os.Lstat(hardlinkTarget); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
 			if err := os.Chmod(path, hdrInfo.Mode()); err != nil {
 				return err
 			}
@@ -81,6 +84,18 @@ func handleLChmod(hdr *tar.Header, path string, hdrInfo os.FileInfo) error {
 		if err := os.Chmod(path, hdrInfo.Mode()); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// hardlink creates newname as a hard link to the oldname file. Unlike
+// [os.Link], which uses link(2) and, on some platforms (such as macOS and
+// FreeBSD), follows oldname if it is a symbolic link, it never follows a
+// symlink, so a symlink cannot be used to hardlink a file outside of the
+// extraction root.
+func hardlink(oldname, newname string) error {
+	if err := unix.Linkat(unix.AT_FDCWD, oldname, unix.AT_FDCWD, newname, 0); err != nil {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: err}
 	}
 	return nil
 }

@@ -22,7 +22,9 @@ import (
 func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64, err error) {
 	tr := tar.NewReader(layer)
 
-	var dirs []*tar.Header
+	var dirs []unpackedDir
+	// unpackedPaths tracks the resolved paths already written in this layer
+	// so that the AUFS opaque-whiteout walk knows which paths to preserve.
 	unpackedPaths := make(map[string]struct{})
 
 	if options == nil {
@@ -72,8 +74,28 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 			}
 		}
 
+		// Reject entries outside of dest before touching the filesystem.
+		// #nosec G305 -- The joined path is checked for path traversal.
+		rel, err := filepath.Rel(dest, filepath.Join(dest, hdr.Name))
+		if err != nil {
+			return 0, err
+		}
+
+		// Note as these operations are platform specific, so must the slash be.
+		if escapesDest(rel) {
+			return 0, breakoutError(fmt.Errorf("%q is outside of %q", hdr.Name, dest))
+		}
+
+		// Resolve symlinks in the entry's parent path within dest, so that
+		// symlinks (created by this or a previous layer) cannot be followed
+		// out of dest.
+		rel, err = resolveArchivePath(dest, rel)
+		if err != nil {
+			return 0, err
+		}
+
 		// Ensure that the parent directory exists.
-		err = createImpliedDirectories(dest, hdr, options)
+		err = createImpliedDirectories(dest, rel, options)
 		if err != nil {
 			return 0, err
 		}
@@ -101,17 +123,8 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 				continue
 			}
 		}
-		// #nosec G305 -- The joined path is guarded against path traversal.
-		path := filepath.Join(dest, hdr.Name)
-		rel, err := filepath.Rel(dest, path)
-		if err != nil {
-			return 0, err
-		}
-
-		// Note as these operations are platform specific, so must the slash be.
-		if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-			return 0, breakoutError(fmt.Errorf("%q is outside of %q", hdr.Name, dest))
-		}
+		// #nosec G305 -- The path is resolved within dest and guarded against path traversal.
+		path := filepath.Join(dest, rel)
 		base := filepath.Base(path)
 
 		if strings.HasPrefix(base, WhiteoutPrefix) {
@@ -189,16 +202,16 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
 			// Directory mtimes must be handled at the end to avoid further
 			// file creation in them to modify the directory mtime
 			if hdr.Typeflag == tar.TypeDir {
-				dirs = append(dirs, hdr)
+				dirs = append(dirs, unpackedDir{hdr: hdr, name: rel})
 			}
+			// Record the resolved path so that it matches the paths
+			// produced by the opaque-whiteout walk.
 			unpackedPaths[path] = struct{}{}
 		}
 	}
 
-	for _, hdr := range dirs {
-		// #nosec G305 -- The header was checked for path traversal before it was appended to the dirs slice.
-		path := filepath.Join(dest, hdr.Name)
-		if err := chtimes(path, hdr.AccessTime, hdr.ModTime); err != nil {
+	for _, d := range dirs {
+		if err := chtimesUnpackedDir(dest, d, d.hdr.AccessTime, d.hdr.ModTime); err != nil {
 			return 0, err
 		}
 	}
