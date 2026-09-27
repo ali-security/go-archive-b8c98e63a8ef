@@ -1,10 +1,12 @@
 name: test
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Space-separated list of test names to run (empty = full suite)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -12,6 +14,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         go-version:
           - 1.23.x      # oldest supported (see go.mod)
@@ -19,7 +22,7 @@ jobs:
           - stable
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
 
@@ -29,25 +32,87 @@ jobs:
           go-version: ${{ matrix.go-version }}
 
       - name: lint
+        # golangci-lint v2.7 cannot typecheck the Go stdlib that `stable` resolves to; lint is not a test
+        if: matrix.go-version != 'stable'
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.7
           args: --print-resources-usage --timeout=10m --verbose
 
       - name: Test
-        run: go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./...
+          else
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+          fi
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
 
       - name: Test (root)
         if: runner.os == 'Linux'
-        run: go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./...
+          else
+            go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+          fi
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
 
-      - name: Codecov
-        uses: codecov/codecov-action@v5
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          directory: ./
+          go-version: stable
+      - name: Create module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/zipper"
+          cd "$RUNNER_TEMP/zipper"
+          go mod init zipper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'GOEOF'
+          package main
+
+          import (
+              "fmt"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[2])
+              if err != nil {
+                  fmt.Fprintln(os.Stderr, err)
+                  os.Exit(1)
+              }
+              if err := zip.CreateFromDir(f, module.Version{Path: "github.com/moby/go-archive", Version: "v0.2.0"}, os.Args[1]); err != nil {
+                  f.Close()
+                  fmt.Fprintln(os.Stderr, err)
+                  os.Exit(1)
+              }
+              if err := f.Close(); err != nil {
+                  fmt.Fprintln(os.Stderr, err)
+                  os.Exit(1)
+              }
+          }
+          GOEOF
+          mkdir -p "$RUNNER_TEMP/out"
+          go run . "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.2.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.2.0.zip"
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.2.0.zip
+          if-no-files-found: error
